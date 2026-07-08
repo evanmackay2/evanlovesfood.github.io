@@ -1,17 +1,42 @@
 import OpenAI from "openai";
 import { fetchTranscript } from "youtube-transcript-plus";
 
-const openai = new OpenAI(); // reads OPENAI_API_KEY from .env.local automatically
+const openai = new OpenAI();
+
+// Plan A: fetch the transcript directly from YouTube (free, works on localhost)
+async function getTranscriptDirect(url) {
+  const transcript = await fetchTranscript(url);
+  return transcript.map((t) => t.text).join(" ");
+}
+
+// Plan B: fetch via Supadata (works on Vercel, where YouTube blocks direct requests)
+async function getTranscriptSupadata(url) {
+  const res = await fetch(
+    `https://api.supadata.ai/v1/youtube/transcript?url=${encodeURIComponent(url)}&text=true`,
+    { headers: { "x-api-key": process.env.SUPADATA_API_KEY } }
+  );
+  if (!res.ok) throw new Error(`Supadata failed: ${res.status}`);
+  const data = await res.json();
+  return data.content;
+}
 
 export async function POST(request) {
   try {
     const { url } = await request.json();
 
-    // 1. Pull the transcript from the YouTube link
-    const transcript = await fetchTranscript(url);
-    const text = transcript.map((t) => t.text).join(" ");
+    // Try Plan A first; if YouTube blocks us, fall back to Plan B
+    let text;
+    try {
+      text = await getTranscriptDirect(url);
+    } catch (e) {
+      console.log("Direct fetch failed, trying Supadata fallback...");
+      text = await getTranscriptSupadata(url);
+    }
 
-    // 2. Turn the transcript into a structured recipe
+    if (!text || text.length < 50) {
+      throw new Error("Transcript came back empty");
+    }
+
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       response_format: { type: "json_object" },
@@ -39,10 +64,7 @@ TRANSCRIPT: ${text.slice(0, 12000)}`,
   } catch (err) {
     console.error("Import failed:", err);
     return Response.json(
-      {
-        error:
-          "Couldn't import that video. Make sure it's a valid YouTube link and the video has captions.",
-      },
+      { error: "Couldn't import that video. Try another one with captions." },
       { status: 400 }
     );
   }
