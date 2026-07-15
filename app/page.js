@@ -8,6 +8,7 @@ const PAPER = "#FCFBF6";
 const GREEN = "#2F7D46";
 const TINT = "#ECF4EE";
 const RULE = "#DAD6CB";
+const RED = "#B3261E";
 
 const CATEGORIES = ["produce", "protein", "dairy", "grains", "pantry", "spices", "other"];
 const CATEGORY_LABELS = {
@@ -20,18 +21,58 @@ const CATEGORY_LABELS = {
   other: "Other",
 };
 
+const MEALS = ["breakfast", "lunch", "dinner", "snack"];
+const MEAL_LABELS = { breakfast: "Breakfast", lunch: "Lunch", dinner: "Dinner", snack: "Snacks" };
+
 const STORAGE_KEY = "evansmeals-data-v1";
+
+// ---- Date helpers (local time, not UTC) ----
+const toDateStr = (d) => {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+const todayStr = () => toDateStr(new Date());
+const shiftDate = (dateStr, days) => {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  dt.setDate(dt.getDate() + days);
+  return toDateStr(dt);
+};
+const prettyDate = (dateStr) => {
+  if (dateStr === todayStr()) return "Today";
+  if (dateStr === shiftDate(todayStr(), -1)) return "Yesterday";
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
+};
 
 export default function EvansMeals() {
   const [tab, setTab] = useState("import");
   const [recipes, setRecipes] = useState([]);
-  const [selected, setSelected] = useState([]); // recipe ids in grocery list
-  const [checked, setChecked] = useState({}); // grocery item -> bool
+  const [selected, setSelected] = useState([]);
+  const [checked, setChecked] = useState({});
+  const [log, setLog] = useState([]); // {id, date, mealType, title, servings, calories, protein_g, carbs_g, fat_g}
+  const [goals, setGoals] = useState({ calories: 2200, protein: 150 });
+
   const [videoUrl, setVideoUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState(null);
   const [loaded, setLoaded] = useState(false);
+
+  // Log-meal panel state (per recipe)
+  const [logPanel, setLogPanel] = useState(null); // recipe id or null
+  const [logForm, setLogForm] = useState({ date: todayStr(), mealType: "dinner", servings: 1 });
+
+  // Log tab state
+  const [viewDate, setViewDate] = useState(todayStr());
+  const [manualText, setManualText] = useState("");
+  const [manualMeal, setManualMeal] = useState("dinner");
+  const [manualLoading, setManualLoading] = useState(false);
+  const [manualError, setManualError] = useState("");
 
   // ---- Load saved data ----
   useEffect(() => {
@@ -42,19 +83,19 @@ export default function EvansMeals() {
         setRecipes(data.recipes || []);
         setSelected(data.selected || []);
         setChecked(data.checked || {});
+        setLog(data.log || []);
+        if (data.goals) setGoals(data.goals);
       }
     } catch (e) {
-      // first run, nothing saved yet
+      // first run
     }
     setLoaded(true);
   }, []);
 
-  const persist = (nextRecipes, nextSelected, nextChecked) => {
+  const persist = (next) => {
     try {
-      localStorage.setItem(
-        STORAGE_KEY,
-        JSON.stringify({ recipes: nextRecipes, selected: nextSelected, checked: nextChecked })
-      );
+      const current = { recipes, selected, checked, log, goals, ...next };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(current));
     } catch (e) {
       console.error("Could not save:", e);
     }
@@ -87,7 +128,7 @@ export default function EvansMeals() {
       const nextSelected = [recipe.id, ...selected];
       setRecipes(nextRecipes);
       setSelected(nextSelected);
-      persist(nextRecipes, nextSelected, checked);
+      persist({ recipes: nextRecipes, selected: nextSelected });
       setVideoUrl("");
       setTab("recipes");
       setExpanded(recipe.id);
@@ -103,7 +144,7 @@ export default function EvansMeals() {
     const nextSelected = selected.filter((s) => s !== id);
     setRecipes(nextRecipes);
     setSelected(nextSelected);
-    persist(nextRecipes, nextSelected, checked);
+    persist({ recipes: nextRecipes, selected: nextSelected });
   };
 
   const toggleSelected = (id) => {
@@ -111,10 +152,106 @@ export default function EvansMeals() {
       ? selected.filter((s) => s !== id)
       : [...selected, id];
     setSelected(nextSelected);
-    persist(recipes, nextSelected, checked);
+    persist({ selected: nextSelected });
   };
 
-  // ---- Grocery list consolidation ----
+  // ---- Logging meals ----
+  const openLogPanel = (recipeId) => {
+    setLogPanel(logPanel === recipeId ? null : recipeId);
+    setLogForm({ date: todayStr(), mealType: "dinner", servings: 1 });
+  };
+
+  const logRecipe = (recipe) => {
+    const s = Number(logForm.servings) || 1;
+    const entry = {
+      id: String(Date.now()),
+      date: logForm.date,
+      mealType: logForm.mealType,
+      title: recipe.title,
+      servings: s,
+      calories: Math.round((recipe.perServing?.calories ?? 0) * s),
+      protein_g: Math.round((recipe.perServing?.protein_g ?? 0) * s),
+      carbs_g: Math.round((recipe.perServing?.carbs_g ?? 0) * s),
+      fat_g: Math.round((recipe.perServing?.fat_g ?? 0) * s),
+    };
+    const nextLog = [...log, entry];
+    setLog(nextLog);
+    persist({ log: nextLog });
+    setLogPanel(null);
+    setViewDate(logForm.date);
+    setTab("log");
+  };
+
+  const logManualMeal = async () => {
+    if (!manualText.trim()) {
+      setManualError("Describe what you ate first.");
+      return;
+    }
+    setManualError("");
+    setManualLoading(true);
+    try {
+      const res = await fetch("/api/estimate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ description: manualText.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Estimate failed");
+
+      const entry = {
+        id: String(Date.now()),
+        date: viewDate,
+        mealType: manualMeal,
+        title: data.title || manualText.slice(0, 60),
+        servings: 1,
+        calories: Math.round(data.calories ?? 0),
+        protein_g: Math.round(data.protein_g ?? 0),
+        carbs_g: Math.round(data.carbs_g ?? 0),
+        fat_g: Math.round(data.fat_g ?? 0),
+      };
+      const nextLog = [...log, entry];
+      setLog(nextLog);
+      persist({ log: nextLog });
+      setManualText("");
+    } catch (e) {
+      setManualError(e.message || "Something went wrong.");
+    }
+    setManualLoading(false);
+  };
+
+  const deleteEntry = (id) => {
+    const nextLog = log.filter((e) => e.id !== id);
+    setLog(nextLog);
+    persist({ log: nextLog });
+  };
+
+  const updateGoals = (field, value) => {
+    const nextGoals = { ...goals, [field]: Number(value) || 0 };
+    setGoals(nextGoals);
+    persist({ goals: nextGoals });
+  };
+
+  // ---- Daily math ----
+  const dayEntries = log.filter((e) => e.date === viewDate);
+  const dayTotals = dayEntries.reduce(
+    (t, e) => ({
+      calories: t.calories + (e.calories || 0),
+      protein: t.protein + (e.protein_g || 0),
+      carbs: t.carbs + (e.carbs_g || 0),
+      fat: t.fat + (e.fat_g || 0),
+    }),
+    { calories: 0, protein: 0, carbs: 0, fat: 0 }
+  );
+
+  // Average across all days that have at least one entry
+  const dayMap = {};
+  log.forEach((e) => {
+    dayMap[e.date] = (dayMap[e.date] || 0) + (e.calories || 0);
+  });
+  const loggedDays = Object.keys(dayMap).length;
+  const avgCalories = loggedDays ? Math.round(Object.values(dayMap).reduce((a, b) => a + b, 0) / loggedDays) : 0;
+
+  // ---- Grocery list ----
   const buildGroceryList = () => {
     const items = {};
     recipes
@@ -146,12 +283,12 @@ export default function EvansMeals() {
   const toggleChecked = (name) => {
     const nextChecked = { ...checked, [name]: !checked[name] };
     setChecked(nextChecked);
-    persist(recipes, selected, nextChecked);
+    persist({ checked: nextChecked });
   };
 
   const clearChecked = () => {
     setChecked({});
-    persist(recipes, selected, {});
+    persist({ checked: {} });
   };
 
   const fmtAmount = (amounts) => {
@@ -159,6 +296,26 @@ export default function EvansMeals() {
     return amounts
       .map((a) => `${Math.round(a.amount * 100) / 100}${a.unit ? " " + a.unit : ""}`)
       .join(" + ");
+  };
+
+  // ---- Small shared styles ----
+  const inputStyle = {
+    boxSizing: "border-box",
+    padding: 10,
+    border: `1.5px solid ${INK}`,
+    background: "#fff",
+    fontSize: 14,
+    fontFamily: "inherit",
+  };
+  const labelStyle = { fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1 };
+  const sectionHead = {
+    fontWeight: 900,
+    fontSize: 12,
+    textTransform: "uppercase",
+    letterSpacing: 1.5,
+    background: INK,
+    color: PAPER,
+    padding: "5px 10px",
   };
 
   // ---- Nutrition label ----
@@ -192,10 +349,10 @@ export default function EvansMeals() {
 
   const tabStyle = (id) => ({
     flex: 1,
-    padding: "10px 4px",
+    padding: "10px 2px",
     fontWeight: 900,
-    fontSize: 13,
-    letterSpacing: 1,
+    fontSize: 12,
+    letterSpacing: 0.5,
     textTransform: "uppercase",
     background: tab === id ? INK : "transparent",
     color: tab === id ? PAPER : INK,
@@ -203,6 +360,8 @@ export default function EvansMeals() {
     cursor: "pointer",
     fontFamily: "inherit",
   });
+
+  const calRemaining = goals.calories - dayTotals.calories;
 
   return (
     <div style={{ minHeight: "100vh", background: PAPER, color: INK, fontFamily: "Helvetica, Arial, sans-serif" }}>
@@ -213,7 +372,7 @@ export default function EvansMeals() {
             evansmeals
           </div>
           <div style={{ fontSize: 12, marginTop: 4, color: "#555" }}>
-            YouTube video → recipe → macros → grocery list
+            YouTube video → recipe → macros → daily log
           </div>
         </div>
 
@@ -224,6 +383,9 @@ export default function EvansMeals() {
           </button>
           <button onClick={() => setTab("recipes")} style={{ ...tabStyle("recipes"), borderRight: `1.5px solid ${INK}` }}>
             Recipes ({recipes.length})
+          </button>
+          <button onClick={() => setTab("log")} style={{ ...tabStyle("log"), borderRight: `1.5px solid ${INK}` }}>
+            Log
           </button>
           <button onClick={() => setTab("grocery")} style={tabStyle("grocery")}>
             Grocery ({groceryCount})
@@ -238,18 +400,16 @@ export default function EvansMeals() {
               transcript gets pulled automatically, and AI turns it into a full
               recipe with estimated macros and a grocery list.
             </div>
-            <label style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1 }}>
-              YouTube link
-            </label>
+            <label style={labelStyle}>YouTube link</label>
             <input
               value={videoUrl}
               onChange={(e) => setVideoUrl(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && !loading && importVideo()}
               placeholder="https://www.youtube.com/watch?v=..."
-              style={{ width: "100%", boxSizing: "border-box", padding: 12, border: `1.5px solid ${INK}`, background: "#fff", fontSize: 14, marginTop: 6, fontFamily: "inherit" }}
+              style={{ ...inputStyle, width: "100%", marginTop: 6 }}
             />
             {error && (
-              <div style={{ marginTop: 10, padding: "8px 10px", border: "1.5px solid #B3261E", color: "#B3261E", fontSize: 13, background: "#fff" }}>
+              <div style={{ marginTop: 10, padding: "8px 10px", border: `1.5px solid ${RED}`, color: RED, fontSize: 13, background: "#fff" }}>
                 {error}
               </div>
             )}
@@ -257,18 +417,10 @@ export default function EvansMeals() {
               onClick={importVideo}
               disabled={loading}
               style={{
-                marginTop: 14,
-                width: "100%",
-                padding: "14px 0",
-                background: loading ? "#777" : GREEN,
-                color: "#fff",
-                border: "none",
-                fontWeight: 900,
-                fontSize: 15,
-                letterSpacing: 1.5,
-                textTransform: "uppercase",
-                cursor: loading ? "wait" : "pointer",
-                fontFamily: "inherit",
+                marginTop: 14, width: "100%", padding: "14px 0",
+                background: loading ? "#777" : GREEN, color: "#fff", border: "none",
+                fontWeight: 900, fontSize: 15, letterSpacing: 1.5, textTransform: "uppercase",
+                cursor: loading ? "wait" : "pointer", fontFamily: "inherit",
               }}
             >
               {loading ? "Watching the video for you..." : "Import recipe"}
@@ -287,6 +439,7 @@ export default function EvansMeals() {
             {recipes.map((r) => {
               const isOpen = expanded === r.id;
               const inList = selected.includes(r.id);
+              const showLogPanel = logPanel === r.id;
               return (
                 <div key={r.id} style={{ border: `1.5px solid ${INK}`, background: "#fff", marginBottom: 16 }}>
                   <div
@@ -302,6 +455,7 @@ export default function EvansMeals() {
                     </div>
                     <div style={{ fontSize: 18, fontWeight: 900 }}>{isOpen ? "–" : "+"}</div>
                   </div>
+
                   {isOpen && (
                     <div style={{ borderTop: `1.5px solid ${INK}`, padding: 14 }}>
                       <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
@@ -318,6 +472,7 @@ export default function EvansMeals() {
                           ))}
                         </div>
                       </div>
+
                       <div style={{ fontWeight: 900, fontSize: 12, textTransform: "uppercase", letterSpacing: 1, borderBottom: `3px solid ${INK}`, paddingBottom: 3, margin: "16px 0 6px" }}>
                         Steps
                       </div>
@@ -334,20 +489,25 @@ export default function EvansMeals() {
                           </a>
                         </div>
                       )}
-                      <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+
+                      {/* Action buttons */}
+                      <div style={{ display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap" }}>
+                        <button
+                          onClick={() => openLogPanel(r.id)}
+                          style={{
+                            flex: 1, minWidth: 130, padding: "10px 0", fontWeight: 900, fontSize: 12,
+                            letterSpacing: 1, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit",
+                            background: INK, color: "#fff", border: `1.5px solid ${INK}`,
+                          }}
+                        >
+                          {showLogPanel ? "Close" : "Log meal"}
+                        </button>
                         <button
                           onClick={() => toggleSelected(r.id)}
                           style={{
-                            flex: 1,
-                            padding: "10px 0",
-                            fontWeight: 900,
-                            fontSize: 12,
-                            letterSpacing: 1,
-                            textTransform: "uppercase",
-                            cursor: "pointer",
-                            fontFamily: "inherit",
-                            background: inList ? TINT : GREEN,
-                            color: inList ? GREEN : "#fff",
+                            flex: 1, minWidth: 130, padding: "10px 0", fontWeight: 900, fontSize: 12,
+                            letterSpacing: 1, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit",
+                            background: inList ? TINT : GREEN, color: inList ? GREEN : "#fff",
                             border: `1.5px solid ${GREEN}`,
                           }}
                         >
@@ -355,16 +515,255 @@ export default function EvansMeals() {
                         </button>
                         <button
                           onClick={() => deleteRecipe(r.id)}
-                          style={{ padding: "10px 14px", background: "#fff", color: "#B3261E", border: "1.5px solid #B3261E", fontWeight: 900, fontSize: 12, textTransform: "uppercase", letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}
+                          style={{ padding: "10px 14px", background: "#fff", color: RED, border: `1.5px solid ${RED}`, fontWeight: 900, fontSize: 12, textTransform: "uppercase", letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}
                         >
                           Delete
                         </button>
                       </div>
+
+                      {/* Log meal panel */}
+                      {showLogPanel && (
+                        <div style={{ marginTop: 12, border: `1.5px solid ${INK}`, background: TINT, padding: 12 }}>
+                          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                            <div style={{ flex: 1, minWidth: 130 }}>
+                              <label style={labelStyle}>Date</label>
+                              <input
+                                type="date"
+                                value={logForm.date}
+                                onChange={(e) => setLogForm({ ...logForm, date: e.target.value })}
+                                style={{ ...inputStyle, width: "100%", marginTop: 4 }}
+                              />
+                            </div>
+                            <div style={{ flex: 1, minWidth: 120 }}>
+                              <label style={labelStyle}>Meal</label>
+                              <select
+                                value={logForm.mealType}
+                                onChange={(e) => setLogForm({ ...logForm, mealType: e.target.value })}
+                                style={{ ...inputStyle, width: "100%", marginTop: 4 }}
+                              >
+                                {MEALS.map((m) => (
+                                  <option key={m} value={m}>{MEAL_LABELS[m]}</option>
+                                ))}
+                              </select>
+                            </div>
+                            <div style={{ width: 100 }}>
+                              <label style={labelStyle}>Servings</label>
+                              <input
+                                type="number"
+                                min="0.25"
+                                step="0.25"
+                                value={logForm.servings}
+                                onChange={(e) => setLogForm({ ...logForm, servings: e.target.value })}
+                                style={{ ...inputStyle, width: "100%", marginTop: 4 }}
+                              />
+                            </div>
+                          </div>
+                          <div style={{ fontSize: 12, marginTop: 8, color: "#555" }}>
+                            = {Math.round((r.perServing?.calories ?? 0) * (Number(logForm.servings) || 1))} cal,{" "}
+                            {Math.round((r.perServing?.protein_g ?? 0) * (Number(logForm.servings) || 1))}g protein
+                          </div>
+                          <button
+                            onClick={() => logRecipe(r)}
+                            style={{
+                              marginTop: 10, width: "100%", padding: "12px 0", background: GREEN, color: "#fff",
+                              border: "none", fontWeight: 900, fontSize: 13, letterSpacing: 1.5,
+                              textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit",
+                            }}
+                          >
+                            Log it
+                          </button>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {/* ---- LOG ---- */}
+        {tab === "log" && (
+          <div>
+            {/* Date navigator */}
+            <div style={{ display: "flex", alignItems: "stretch", border: `1.5px solid ${INK}`, background: "#fff", marginBottom: 16 }}>
+              <button
+                onClick={() => setViewDate(shiftDate(viewDate, -1))}
+                style={{ padding: "10px 16px", border: "none", borderRight: `1.5px solid ${INK}`, background: "transparent", fontWeight: 900, fontSize: 16, cursor: "pointer", fontFamily: "inherit" }}
+              >
+                ‹
+              </button>
+              <div style={{ flex: 1, textAlign: "center", padding: "10px 4px", fontWeight: 900, fontSize: 15 }}>
+                {prettyDate(viewDate)}
+                {viewDate !== todayStr() && (
+                  <button
+                    onClick={() => setViewDate(todayStr())}
+                    style={{ marginLeft: 10, fontSize: 10, fontWeight: 900, textTransform: "uppercase", letterSpacing: 1, background: TINT, border: `1px solid ${GREEN}`, color: GREEN, padding: "2px 6px", cursor: "pointer", fontFamily: "inherit" }}
+                  >
+                    Today
+                  </button>
+                )}
+              </div>
+              <button
+                onClick={() => setViewDate(shiftDate(viewDate, 1))}
+                style={{ padding: "10px 16px", border: "none", borderLeft: `1.5px solid ${INK}`, background: "transparent", fontWeight: 900, fontSize: 16, cursor: "pointer", fontFamily: "inherit" }}
+              >
+                ›
+              </button>
+            </div>
+
+            {/* Day totals vs goals */}
+            <div style={{ border: `1.5px solid ${INK}`, background: "#fff", padding: "10px 12px", marginBottom: 16 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", borderBottom: `6px solid ${INK}`, paddingBottom: 6 }}>
+                <span style={{ fontWeight: 900, fontSize: 16 }}>Day total</span>
+                <span style={{ fontWeight: 900, fontSize: 26 }}>
+                  {dayTotals.calories}
+                  <span style={{ fontSize: 13, fontWeight: 700, color: "#555" }}> / {goals.calories} cal</span>
+                </span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, padding: "6px 0", borderBottom: `1px solid ${RULE}` }}>
+                <span style={{ fontWeight: 700, color: GREEN }}>Protein</span>
+                <span style={{ fontWeight: 700 }}>{dayTotals.protein}g / {goals.protein}g</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, padding: "6px 0", borderBottom: `1px solid ${RULE}` }}>
+                <span style={{ fontWeight: 700 }}>Carbs</span>
+                <span style={{ fontWeight: 700 }}>{dayTotals.carbs}g</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, padding: "6px 0" }}>
+                <span style={{ fontWeight: 700 }}>Fat</span>
+                <span style={{ fontWeight: 700 }}>{dayTotals.fat}g</span>
+              </div>
+              <div style={{ fontSize: 12, marginTop: 4, padding: "6px 8px", background: calRemaining >= 0 ? TINT : "#FDECEA", border: `1px solid ${calRemaining >= 0 ? GREEN : RED}`, color: calRemaining >= 0 ? GREEN : RED, fontWeight: 700 }}>
+                {calRemaining >= 0
+                  ? `${calRemaining} calories left today`
+                  : `${Math.abs(calRemaining)} calories over target`}
+              </div>
+            </div>
+
+            {/* Meals for the day */}
+            {MEALS.map((m) => {
+              const entries = dayEntries.filter((e) => e.mealType === m);
+              if (entries.length === 0) return null;
+              return (
+                <div key={m} style={{ marginBottom: 14 }}>
+                  <div style={sectionHead}>{MEAL_LABELS[m]}</div>
+                  <div style={{ border: `1.5px solid ${INK}`, borderTop: "none", background: "#fff" }}>
+                    {entries.map((e) => (
+                      <div key={e.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "9px 10px", borderBottom: `1px solid ${RULE}` }}>
+                        <div>
+                          <div style={{ fontSize: 14, fontWeight: 700 }}>
+                            {e.title}
+                            {e.servings !== 1 ? ` ×${e.servings}` : ""}
+                          </div>
+                          <div style={{ fontSize: 12, color: "#555" }}>
+                            {e.calories} cal · {e.protein_g}g protein · {e.carbs_g}g carbs · {e.fat_g}g fat
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => deleteEntry(e.id)}
+                          style={{ background: "none", border: "none", color: RED, fontWeight: 900, fontSize: 16, cursor: "pointer", fontFamily: "inherit" }}
+                          title="Remove entry"
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+            {dayEntries.length === 0 && (
+              <div style={{ textAlign: "center", padding: "28px 16px", border: `1.5px dashed ${RULE}`, fontSize: 14, color: "#666", marginBottom: 14 }}>
+                Nothing logged for {prettyDate(viewDate).toLowerCase()} yet.
+              </div>
+            )}
+
+            {/* Manual meal entry */}
+            <div style={{ border: `1.5px solid ${INK}`, background: TINT, padding: 12, marginBottom: 16 }}>
+              <div style={{ fontWeight: 900, fontSize: 13, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>
+                Log a meal by describing it
+              </div>
+              <textarea
+                value={manualText}
+                onChange={(e) => setManualText(e.target.value)}
+                placeholder={'e.g. "6 oz filet, mashed potatoes, house salad, 12 fl oz coca cola"'}
+                rows={2}
+                style={{ ...inputStyle, width: "100%", resize: "vertical" }}
+              />
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <select
+                  value={manualMeal}
+                  onChange={(e) => setManualMeal(e.target.value)}
+                  style={{ ...inputStyle, flex: 1 }}
+                >
+                  {MEALS.map((m) => (
+                    <option key={m} value={m}>{MEAL_LABELS[m]}</option>
+                  ))}
+                </select>
+                <button
+                  onClick={logManualMeal}
+                  disabled={manualLoading}
+                  style={{
+                    flex: 2, padding: "10px 0", background: manualLoading ? "#777" : GREEN, color: "#fff",
+                    border: "none", fontWeight: 900, fontSize: 13, letterSpacing: 1, textTransform: "uppercase",
+                    cursor: manualLoading ? "wait" : "pointer", fontFamily: "inherit",
+                  }}
+                >
+                  {manualLoading ? "Estimating..." : `Estimate & log to ${prettyDate(viewDate)}`}
+                </button>
+              </div>
+              {manualError && (
+                <div style={{ marginTop: 8, padding: "8px 10px", border: `1.5px solid ${RED}`, color: RED, fontSize: 13, background: "#fff" }}>
+                  {manualError}
+                </div>
+              )}
+            </div>
+
+            {/* Stats + goals */}
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+              <div style={{ flex: 1, minWidth: 160, border: `1.5px solid ${INK}`, background: "#fff", padding: "10px 12px" }}>
+                <div style={{ fontSize: 11, fontWeight: 900, textTransform: "uppercase", letterSpacing: 1, borderBottom: `3px solid ${INK}`, paddingBottom: 3, marginBottom: 6 }}>
+                  Your average
+                </div>
+                <div style={{ fontSize: 24, fontWeight: 900 }}>
+                  {avgCalories}
+                  <span style={{ fontSize: 12, fontWeight: 700, color: "#555" }}> cal/day</span>
+                </div>
+                <div style={{ fontSize: 12, color: "#555", marginTop: 2 }}>
+                  across {loggedDays} logged day{loggedDays === 1 ? "" : "s"}
+                  {loggedDays > 0 && (
+                    <span style={{ fontWeight: 700, color: avgCalories <= goals.calories ? GREEN : RED }}>
+                      {" "}· {avgCalories <= goals.calories ? "on track" : "over goal"}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div style={{ flex: 1, minWidth: 160, border: `1.5px solid ${INK}`, background: "#fff", padding: "10px 12px" }}>
+                <div style={{ fontSize: 11, fontWeight: 900, textTransform: "uppercase", letterSpacing: 1, borderBottom: `3px solid ${INK}`, paddingBottom: 3, marginBottom: 6 }}>
+                  Daily goals
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase" }}>Calories</label>
+                    <input
+                      type="number"
+                      value={goals.calories}
+                      onChange={(e) => updateGoals("calories", e.target.value)}
+                      style={{ ...inputStyle, width: "100%", padding: 6, fontSize: 13 }}
+                    />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase" }}>Protein (g)</label>
+                    <input
+                      type="number"
+                      value={goals.protein}
+                      onChange={(e) => updateGoals("protein", e.target.value)}
+                      style={{ ...inputStyle, width: "100%", padding: 6, fontSize: 13 }}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         )}
 
@@ -390,9 +789,7 @@ export default function EvansMeals() {
                 </div>
                 {CATEGORIES.filter((c) => grocery[c].length > 0).map((cat) => (
                   <div key={cat} style={{ marginBottom: 18 }}>
-                    <div style={{ fontWeight: 900, fontSize: 12, textTransform: "uppercase", letterSpacing: 1.5, background: INK, color: PAPER, padding: "5px 10px" }}>
-                      {CATEGORY_LABELS[cat]}
-                    </div>
+                    <div style={sectionHead}>{CATEGORY_LABELS[cat]}</div>
                     <div style={{ border: `1.5px solid ${INK}`, borderTop: "none", background: "#fff" }}>
                       {grocery[cat].map((item) => {
                         const done = !!checked[item.name.toLowerCase()];
