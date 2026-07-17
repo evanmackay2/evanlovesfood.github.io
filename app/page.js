@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import { supabase } from "./lib/supabase";
 
 // ---- Design tokens ----
 const INK = "#141414";
@@ -58,6 +59,16 @@ const prettyDate = (dateStr) => {
 };
 
 export default function EvansMeals() {
+  // ---- Auth state ----
+  const [session, setSession] = useState(null);
+  const [sessionChecked, setSessionChecked] = useState(false);
+  const [authMode, setAuthMode] = useState("signin"); // "signin" | "signup"
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authLoading, setAuthLoading] = useState(false);
+
+  // ---- App state ----
   const [tab, setTab] = useState("import");
   const [recipes, setRecipes] = useState([]);
   const [selected, setSelected] = useState([]);
@@ -72,19 +83,17 @@ export default function EvansMeals() {
     heightIn: "",
     activity: "moderate",
   });
+  const [dataLoaded, setDataLoaded] = useState(false);
 
   const [videoUrl, setVideoUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState(null);
-  const [loaded, setLoaded] = useState(false);
 
-  // Write-your-own recipe state
   const [writeText, setWriteText] = useState("");
   const [writeLoading, setWriteLoading] = useState(false);
   const [writeError, setWriteError] = useState("");
 
-  // Recipe editing state
   const [editingId, setEditingId] = useState(null);
   const [draft, setDraft] = useState(null);
 
@@ -98,32 +107,139 @@ export default function EvansMeals() {
   const [manualError, setManualError] = useState("");
   const [showCalc, setShowCalc] = useState(false);
 
-  // ---- Load saved data ----
+  // Refs for debounced cloud saving
+  const saveTimer = useRef(null);
+  const pendingData = useRef(null);
+
+  // ---- Watch the auth session ----
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const data = JSON.parse(raw);
-        setRecipes(data.recipes || []);
-        setSelected(data.selected || []);
-        setChecked(data.checked || {});
-        setLog(data.log || []);
-        if (data.goals) setGoals(data.goals);
-        if (data.profile) setProfile(data.profile);
-      }
-    } catch (e) {
-      // first run
-    }
-    setLoaded(true);
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setSessionChecked(true);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      setSession(newSession);
+    });
+    return () => listener.subscription.unsubscribe();
   }, []);
 
+  // ---- Load this user's data once signed in ----
+  useEffect(() => {
+    if (!session) {
+      setDataLoaded(false);
+      return;
+    }
+    (async () => {
+      try {
+        const { data: row, error: readError } = await supabase
+          .from("user_data")
+          .select("data")
+          .eq("id", session.user.id)
+          .maybeSingle();
+        if (readError) throw readError;
+
+        let data = row?.data;
+
+        // First login on this account: migrate any old localStorage data
+        if (!data || Object.keys(data).length === 0) {
+          try {
+            const legacy = localStorage.getItem(STORAGE_KEY);
+            if (legacy) data = JSON.parse(legacy);
+          } catch (e) {
+            // no legacy data
+          }
+          if (data && Object.keys(data).length > 0) {
+            await supabase.from("user_data").upsert({
+              id: session.user.id,
+              data,
+              updated_at: new Date().toISOString(),
+            });
+          }
+        }
+
+        if (data) {
+          setRecipes(data.recipes || []);
+          setSelected(data.selected || []);
+          setChecked(data.checked || {});
+          setLog(data.log || []);
+          if (data.goals) setGoals(data.goals);
+          if (data.profile) setProfile(data.profile);
+        } else {
+          setRecipes([]);
+          setSelected([]);
+          setChecked({});
+          setLog([]);
+        }
+      } catch (e) {
+        console.error("Could not load your data:", e);
+      }
+      setDataLoaded(true);
+    })();
+  }, [session]);
+
+  // ---- Persist: instant local cache + debounced cloud write ----
   const persist = (next) => {
+    const current = { recipes, selected, checked, log, goals, profile, ...next };
     try {
-      const current = { recipes, selected, checked, log, goals, profile, ...next };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(current));
     } catch (e) {
-      console.error("Could not save:", e);
+      // cache write failed; cloud still saves
     }
+    if (!session) return;
+    pendingData.current = current;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try {
+        await supabase.from("user_data").upsert({
+          id: session.user.id,
+          data: pendingData.current,
+          updated_at: new Date().toISOString(),
+        });
+      } catch (e) {
+        console.error("Cloud save failed:", e);
+      }
+    }, 800);
+  };
+
+  // ---- Auth actions ----
+  const handleAuth = async () => {
+    if (!authEmail.trim() || !authPassword) {
+      setAuthError("Enter your email and a password.");
+      return;
+    }
+    setAuthError("");
+    setAuthLoading(true);
+    try {
+      if (authMode === "signup") {
+        const { error: e } = await supabase.auth.signUp({
+          email: authEmail.trim(),
+          password: authPassword,
+        });
+        if (e) throw e;
+      } else {
+        const { error: e } = await supabase.auth.signInWithPassword({
+          email: authEmail.trim(),
+          password: authPassword,
+        });
+        if (e) throw e;
+      }
+      setAuthEmail("");
+      setAuthPassword("");
+    } catch (e) {
+      setAuthError(e.message || "Something went wrong. Try again.");
+    }
+    setAuthLoading(false);
+  };
+
+  const signOut = async () => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch (e) {
+      // fine
+    }
+    await supabase.auth.signOut();
+    setTab("import");
   };
 
   // ---- TDEE math (Harris-Benedict, imperial) ----
@@ -612,17 +728,129 @@ export default function EvansMeals() {
     </div>
   );
 
+  // ================= RENDER =================
+
+  // Still checking whether someone is signed in
+  if (!sessionChecked) {
+    return (
+      <div style={{ minHeight: "100vh", background: PAPER, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "Helvetica, Arial, sans-serif" }}>
+        <div style={{ fontWeight: 900, fontSize: 18, color: INK }}>evansmeals</div>
+      </div>
+    );
+  }
+
+  // ---- Sign in / sign up screen ----
+  if (!session) {
+    return (
+      <div style={{ minHeight: "100vh", background: PAPER, color: INK, fontFamily: "Helvetica, Arial, sans-serif" }}>
+        <div style={{ maxWidth: 420, margin: "0 auto", padding: "60px 16px" }}>
+          <div style={{ borderBottom: `8px solid ${INK}`, paddingBottom: 8 }}>
+            <div style={{ fontSize: 40, fontWeight: 900, letterSpacing: -2, lineHeight: 1 }}>
+              evansmeals
+            </div>
+            <div style={{ fontSize: 12, marginTop: 4, color: "#555" }}>
+              Any recipe → macros → daily log
+            </div>
+          </div>
+
+          <div style={{ border: `1.5px solid ${INK}`, borderTop: "none", background: "#fff", padding: 16 }}>
+            <div style={{ display: "flex", marginBottom: 16, border: `1.5px solid ${INK}` }}>
+              <button
+                onClick={() => { setAuthMode("signin"); setAuthError(""); }}
+                style={{
+                  flex: 1, padding: "9px 0", fontWeight: 900, fontSize: 12, letterSpacing: 1,
+                  textTransform: "uppercase", border: "none", cursor: "pointer", fontFamily: "inherit",
+                  background: authMode === "signin" ? INK : "transparent",
+                  color: authMode === "signin" ? PAPER : INK,
+                }}
+              >
+                Sign in
+              </button>
+              <button
+                onClick={() => { setAuthMode("signup"); setAuthError(""); }}
+                style={{
+                  flex: 1, padding: "9px 0", fontWeight: 900, fontSize: 12, letterSpacing: 1,
+                  textTransform: "uppercase", border: "none", borderLeft: `1.5px solid ${INK}`,
+                  cursor: "pointer", fontFamily: "inherit",
+                  background: authMode === "signup" ? INK : "transparent",
+                  color: authMode === "signup" ? PAPER : INK,
+                }}
+              >
+                Create account
+              </button>
+            </div>
+
+            <label style={labelStyle}>Email</label>
+            <input
+              type="email"
+              value={authEmail}
+              onChange={(e) => setAuthEmail(e.target.value)}
+              placeholder="you@example.com"
+              style={{ ...inputStyle, width: "100%", marginTop: 6, marginBottom: 12 }}
+            />
+            <label style={labelStyle}>Password</label>
+            <input
+              type="password"
+              value={authPassword}
+              onChange={(e) => setAuthPassword(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && !authLoading && handleAuth()}
+              placeholder={authMode === "signup" ? "At least 6 characters" : "Your password"}
+              style={{ ...inputStyle, width: "100%", marginTop: 6 }}
+            />
+
+            {authError && (
+              <div style={{ marginTop: 12, padding: "8px 10px", border: `1.5px solid ${RED}`, color: RED, fontSize: 13, background: "#fff" }}>
+                {authError}
+              </div>
+            )}
+
+            <button onClick={handleAuth} disabled={authLoading} style={{ ...bigButton(GREEN, authLoading), marginTop: 14 }}>
+              {authLoading
+                ? "One moment..."
+                : authMode === "signup"
+                ? "Create my account"
+                : "Sign in"}
+            </button>
+
+            <div style={{ fontSize: 11, color: "#555", marginTop: 12, lineHeight: 1.5 }}>
+              Your recipes, log, and goals are private to your account and sync
+              across all your devices.
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Signed in but still fetching their data
+  if (!dataLoaded) {
+    return (
+      <div style={{ minHeight: "100vh", background: PAPER, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "Helvetica, Arial, sans-serif" }}>
+        <div style={{ fontWeight: 900, fontSize: 15, color: INK }}>Loading your kitchen...</div>
+      </div>
+    );
+  }
+
+  // ---- The app ----
   return (
     <div style={{ minHeight: "100vh", background: PAPER, color: INK, fontFamily: "Helvetica, Arial, sans-serif" }}>
       <div style={{ maxWidth: 640, margin: "0 auto", padding: "24px 16px 80px" }}>
         {/* Header */}
-        <div style={{ borderBottom: `8px solid ${INK}`, paddingBottom: 8 }}>
-          <div style={{ fontSize: 34, fontWeight: 900, letterSpacing: -1.5, lineHeight: 1 }}>
-            evansmeals
+        <div style={{ borderBottom: `8px solid ${INK}`, paddingBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+          <div>
+            <div style={{ fontSize: 34, fontWeight: 900, letterSpacing: -1.5, lineHeight: 1 }}>
+              evansmeals
+            </div>
+            <div style={{ fontSize: 12, marginTop: 4, color: "#555" }}>
+              {session.user.email}
+            </div>
           </div>
-          <div style={{ fontSize: 12, marginTop: 4, color: "#555" }}>
-            Any recipe → macros → daily log
-          </div>
+          <button
+            onClick={signOut}
+            style={{ background: "none", border: `1.5px solid ${INK}`, padding: "6px 10px", fontSize: 10, fontWeight: 900, textTransform: "uppercase", letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}
+          >
+            Sign out
+          </button>
         </div>
 
         {/* Tabs */}
@@ -666,7 +894,6 @@ export default function EvansMeals() {
               {loading ? "Reading the recipe..." : "Import recipe"}
             </button>
 
-            {/* Write your own */}
             <div style={{ textAlign: "center", margin: "22px 0 14px", fontWeight: 900, fontSize: 12, letterSpacing: 2, color: "#888" }}>
               — OR —
             </div>
@@ -700,7 +927,7 @@ export default function EvansMeals() {
         {/* ---- RECIPES ---- */}
         {tab === "recipes" && (
           <div>
-            {loaded && recipes.length === 0 && (
+            {recipes.length === 0 && (
               <div style={{ textAlign: "center", padding: "48px 16px", border: `1.5px dashed ${RULE}`, fontSize: 14, color: "#666" }}>
                 No recipes yet. Head to <b>Import</b> to paste a link or write your own.
               </div>
