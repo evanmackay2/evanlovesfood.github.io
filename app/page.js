@@ -74,6 +74,8 @@ export default function EvansMeals() {
   const [selected, setSelected] = useState([]);
   const [checked, setChecked] = useState({});
   const [log, setLog] = useState([]);
+  const [workouts, setWorkouts] = useState([]);
+  const [newExercise, setNewExercise] = useState("");
   const [goals, setGoals] = useState({ calories: 2200, protein: 150 });
   const [profile, setProfile] = useState({
     gender: "male",
@@ -109,9 +111,10 @@ export default function EvansMeals() {
 
   // Photo logging state
   const [photoData, setPhotoData] = useState(null);
-  const [photoLoading, setPhotoLoading] = useState(false);
+  const [photoBusy, setPhotoBusy] = useState(null); // null | "meal" | "recipe" | "both"
   const [photoError, setPhotoError] = useState("");
-  const photoInputRef = useRef(null);
+  const cameraInputRef = useRef(null);
+  const galleryInputRef = useRef(null);
 
   // Suggestions state
   const [suggestOpen, setSuggestOpen] = useState(false);
@@ -174,6 +177,7 @@ export default function EvansMeals() {
           setSelected(data.selected || []);
           setChecked(data.checked || {});
           setLog(data.log || []);
+          setWorkouts(data.workouts || []);
           if (data.goals) setGoals(data.goals);
           if (data.profile) setProfile(data.profile);
         } else {
@@ -181,6 +185,7 @@ export default function EvansMeals() {
           setSelected([]);
           setChecked({});
           setLog([]);
+          setWorkouts([]);
         }
       } catch (e) {
         console.error("Could not load your data:", e);
@@ -191,7 +196,7 @@ export default function EvansMeals() {
 
   // ---- Persist: instant local cache + debounced cloud write ----
   const persist = (next) => {
-    const current = { recipes, selected, checked, log, goals, profile, ...next };
+    const current = { recipes, selected, checked, log, workouts, goals, profile, ...next };
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(current));
     } catch (e) {
@@ -544,15 +549,16 @@ export default function EvansMeals() {
     e.target.value = "";
   };
 
-  const analyzePhoto = async () => {
+  // Photo → log as a meal
+  const photoAsMeal = async () => {
     if (!photoData) return;
     setPhotoError("");
-    setPhotoLoading(true);
+    setPhotoBusy("meal");
     try {
       const res = await fetch("/api/photo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image: photoData }),
+        body: JSON.stringify({ image: photoData, mode: "meal" }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Analysis failed");
@@ -562,7 +568,7 @@ export default function EvansMeals() {
 
       addLogEntry({
         id: String(Date.now()),
-        date: viewDate,
+        date: todayStr(),
         mealType: manualMeal,
         title: `📷 ${data.title || "Photo meal"}`,
         servings: 1,
@@ -572,10 +578,77 @@ export default function EvansMeals() {
         fat_g: Math.round(data.fat_g ?? 0),
       });
       setPhotoData(null);
+      setViewDate(todayStr());
+      setTab("log");
     } catch (e) {
       setPhotoError(e.message || "Something went wrong.");
     }
-    setPhotoLoading(false);
+    setPhotoBusy(null);
+  };
+
+  // Photo → save as recipe (optionally also log 1 serving)
+  const photoAsRecipe = async (alsoLog) => {
+    if (!photoData) return;
+    setPhotoError("");
+    setPhotoBusy(alsoLog ? "both" : "recipe");
+    try {
+      const res = await fetch("/api/photo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image: photoData, mode: "recipe" }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Analysis failed");
+      if (data.title === "Couldn't read a recipe") {
+        throw new Error("Couldn't find a recipe in that photo. Try a clearer shot of the recipe or dish.");
+      }
+
+      // Build everything, then save state + cloud in ONE update so the
+      // recipe and the log entry can't overwrite each other.
+      const recipe = {
+        id: String(Date.now()),
+        source: "",
+        addedAt: new Date().toISOString(),
+        ...data,
+      };
+      const nextRecipes = [recipe, ...recipes];
+      const nextSelected = [recipe.id, ...selected];
+      let nextLog = log;
+
+      if (alsoLog) {
+        nextLog = [
+          ...log,
+          {
+            id: String(Date.now() + 1),
+            date: todayStr(),
+            mealType: manualMeal,
+            title: recipe.title,
+            servings: 1,
+            calories: Math.round(recipe.perServing?.calories ?? 0),
+            protein_g: Math.round(recipe.perServing?.protein_g ?? 0),
+            carbs_g: Math.round(recipe.perServing?.carbs_g ?? 0),
+            fat_g: Math.round(recipe.perServing?.fat_g ?? 0),
+          },
+        ];
+      }
+
+      setRecipes(nextRecipes);
+      setSelected(nextSelected);
+      setLog(nextLog);
+      persist({ recipes: nextRecipes, selected: nextSelected, log: nextLog });
+      setPhotoData(null);
+
+      if (alsoLog) {
+        setViewDate(todayStr());
+        setTab("log");
+      } else {
+        setTab("recipes");
+        setExpanded(recipe.id);
+      }
+    } catch (e) {
+      setPhotoError(e.message || "Something went wrong.");
+    }
+    setPhotoBusy(null);
   };
 
   const deleteEntry = (id) => {
@@ -667,6 +740,55 @@ export default function EvansMeals() {
     });
     setSuggestions(suggestions.filter((x) => x !== s));
   };
+
+  // ---- Workout tracking ----
+  const dayWorkouts = workouts.filter((wk) => wk.date === viewDate);
+
+  const addExercise = () => {
+    const name = newExercise.trim();
+    if (!name) return;
+    const entry = { id: String(Date.now()), date: viewDate, exercise: name, sets: [""] };
+    const nextWorkouts = [...workouts, entry];
+    setWorkouts(nextWorkouts);
+    persist({ workouts: nextWorkouts });
+    setNewExercise("");
+  };
+
+  const changeSets = (id, delta) => {
+    const nextWorkouts = workouts.map((wk) => {
+      if (wk.id !== id) return wk;
+      let sets = [...wk.sets];
+      if (delta > 0) sets.push("");
+      else if (sets.length > 1) sets.pop();
+      return { ...wk, sets };
+    });
+    setWorkouts(nextWorkouts);
+    persist({ workouts: nextWorkouts });
+  };
+
+  const updateReps = (id, setIdx, value) => {
+    const nextWorkouts = workouts.map((wk) => {
+      if (wk.id !== id) return wk;
+      const sets = wk.sets.map((s, i) => (i === setIdx ? value : s));
+      return { ...wk, sets };
+    });
+    setWorkouts(nextWorkouts);
+    persist({ workouts: nextWorkouts });
+  };
+
+  const deleteExercise = (id) => {
+    const nextWorkouts = workouts.filter((wk) => wk.id !== id);
+    setWorkouts(nextWorkouts);
+    persist({ workouts: nextWorkouts });
+  };
+
+  const workoutTotals = dayWorkouts.reduce(
+    (t, wk) => ({
+      sets: t.sets + wk.sets.length,
+      reps: t.reps + wk.sets.reduce((s, r) => s + (Number(r) || 0), 0),
+    }),
+    { sets: 0, reps: 0 }
+  );
 
   // ---- Grocery list ----
   const buildGroceryList = () => {
@@ -988,6 +1110,9 @@ export default function EvansMeals() {
           <button onClick={() => setTab("log")} style={{ ...tabStyle("log"), borderRight: `1.5px solid ${INK}` }}>
             Log
           </button>
+          <button onClick={() => setTab("workout")} style={{ ...tabStyle("workout"), borderRight: `1.5px solid ${INK}` }}>
+            Workout
+          </button>
           <button onClick={() => setTab("grocery")} style={tabStyle("grocery")}>
             Grocery ({groceryCount})
           </button>
@@ -1044,6 +1169,143 @@ export default function EvansMeals() {
                 AI will structure it, estimate the macros, and file the ingredients
                 for your grocery list. You can edit everything afterwards.
               </div>
+            </div>
+
+            <div style={{ textAlign: "center", margin: "22px 0 14px", fontWeight: 900, fontSize: 12, letterSpacing: 2, color: "#888" }}>
+              — OR —
+            </div>
+            {/* Photo section */}
+            <div style={{ border: `1.5px solid ${INK}`, background: "#fff", padding: 12 }}>
+                <div style={{ fontWeight: 900, fontSize: 13, textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>
+                  📷 Snap or upload a photo
+                </div>
+                <div style={{ fontSize: 12, color: "#555", marginBottom: 8, lineHeight: 1.4 }}>
+                  A plate of food to log, or a recipe to save - cookbook page,
+                  recipe card, screenshot, or a dish you want the recipe for.
+                </div>
+                <input
+                  ref={cameraInputRef}
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  onChange={handlePhotoSelect}
+                  style={{ display: "none" }}
+                />
+                <input
+                  ref={galleryInputRef}
+                  type="file"
+                  accept="image/*"
+                  onChange={handlePhotoSelect}
+                  style={{ display: "none" }}
+                />
+
+                {!photoData ? (
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      onClick={() => cameraInputRef.current && cameraInputRef.current.click()}
+                      style={{
+                        flex: 1, padding: "12px 0", background: "#fff", color: INK,
+                        border: `1.5px dashed ${INK}`, fontWeight: 900, fontSize: 12, letterSpacing: 1,
+                        textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit",
+                      }}
+                    >
+                      📷 Take photo
+                    </button>
+                    <button
+                      onClick={() => galleryInputRef.current && galleryInputRef.current.click()}
+                      style={{
+                        flex: 1, padding: "12px 0", background: "#fff", color: INK,
+                        border: `1.5px dashed ${INK}`, fontWeight: 900, fontSize: 12, letterSpacing: 1,
+                        textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit",
+                      }}
+                    >
+                      🖼 Upload photo
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    <img
+                      src={photoData}
+                      alt="Your photo"
+                      style={{ width: "100%", maxHeight: 220, objectFit: "cover", border: `1.5px solid ${INK}` }}
+                    />
+                    <div style={{ fontSize: 12, fontWeight: 700, margin: "8px 0 4px" }}>
+                      What would you like to do with this photo?
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase" }}>If logging:</span>
+                      <select
+                        value={manualMeal}
+                        onChange={(e) => setManualMeal(e.target.value)}
+                        style={{ ...inputStyle, flex: 1, padding: 7, fontSize: 13 }}
+                      >
+                        {MEALS.map((m) => (
+                          <option key={m} value={m}>{MEAL_LABELS[m]}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      <button
+                        onClick={photoAsMeal}
+                        disabled={!!photoBusy}
+                        style={{
+                          flex: 1, minWidth: 140, padding: "10px 4px",
+                          background: photoBusy === "meal" ? "#777" : INK, color: "#fff",
+                          border: "none", fontWeight: 900, fontSize: 11, letterSpacing: 0.5,
+                          textTransform: "uppercase", cursor: photoBusy ? "wait" : "pointer", fontFamily: "inherit",
+                        }}
+                      >
+                        {photoBusy === "meal" ? "Analyzing..." : `Log as ${MEAL_LABELS[manualMeal]}`}
+                      </button>
+                      <button
+                        onClick={() => photoAsRecipe(false)}
+                        disabled={!!photoBusy}
+                        style={{
+                          flex: 1, minWidth: 140, padding: "10px 4px",
+                          background: photoBusy === "recipe" ? "#777" : GREEN, color: "#fff",
+                          border: "none", fontWeight: 900, fontSize: 11, letterSpacing: 0.5,
+                          textTransform: "uppercase", cursor: photoBusy ? "wait" : "pointer", fontFamily: "inherit",
+                        }}
+                      >
+                        {photoBusy === "recipe" ? "Reading recipe..." : "Save as recipe"}
+                      </button>
+                      <button
+                        onClick={() => photoAsRecipe(true)}
+                        disabled={!!photoBusy}
+                        style={{
+                          flex: 1, minWidth: 140, padding: "10px 4px",
+                          background: photoBusy === "both" ? "#777" : "#fff",
+                          color: photoBusy === "both" ? "#fff" : GREEN,
+                          border: `1.5px solid ${GREEN}`, fontWeight: 900, fontSize: 11, letterSpacing: 0.5,
+                          textTransform: "uppercase", cursor: photoBusy ? "wait" : "pointer", fontFamily: "inherit",
+                        }}
+                      >
+                        {photoBusy === "both" ? "Working..." : "Save + log 1 serving"}
+                      </button>
+                    </div>
+                    <button
+                      onClick={() => setPhotoData(null)}
+                      disabled={!!photoBusy}
+                      style={{
+                        marginTop: 8, width: "100%", padding: "8px 0", background: "#fff", color: INK,
+                        border: `1.5px solid ${INK}`, fontWeight: 900, fontSize: 11, letterSpacing: 1,
+                        textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit",
+                      }}
+                    >
+                      Choose a different photo
+                    </button>
+                  </div>
+                )}
+                {photoError && (
+                  <div style={{ marginTop: 8, padding: "8px 10px", border: `1.5px solid ${RED}`, color: RED, fontSize: 13, background: "#fff" }}>
+                    {photoError}
+                  </div>
+                )}
+                <div style={{ fontSize: 11, color: "#555", marginTop: 8, lineHeight: 1.4 }}>
+                  Meal photo estimates are rough (±25%) since portion sizes are hard
+                  to judge from one angle. Recipe photos work best when the text is
+                  clear and well-lit.
+                </div>
             </div>
           </div>
         )}
@@ -1552,73 +1814,6 @@ export default function EvansMeals() {
                   {manualError}
                 </div>
               )}
-
-              {/* Photo logging */}
-              <div style={{ borderTop: `1.5px dashed ${INK}`, marginTop: 12, paddingTop: 12 }}>
-                <div style={{ fontWeight: 900, fontSize: 13, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>
-                  📷 Or snap a photo of your plate
-                </div>
-                <input
-                  ref={photoInputRef}
-                  type="file"
-                  accept="image/*"
-                  capture="environment"
-                  onChange={handlePhotoSelect}
-                  style={{ display: "none" }}
-                />
-                {!photoData ? (
-                  <button
-                    onClick={() => photoInputRef.current && photoInputRef.current.click()}
-                    style={{
-                      width: "100%", padding: "12px 0", background: "#fff", color: INK,
-                      border: `1.5px dashed ${INK}`, fontWeight: 900, fontSize: 12, letterSpacing: 1,
-                      textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit",
-                    }}
-                  >
-                    Take / choose a photo
-                  </button>
-                ) : (
-                  <div>
-                    <img
-                      src={photoData}
-                      alt="Your meal"
-                      style={{ width: "100%", maxHeight: 220, objectFit: "cover", border: `1.5px solid ${INK}` }}
-                    />
-                    <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                      <button
-                        onClick={analyzePhoto}
-                        disabled={photoLoading}
-                        style={{
-                          flex: 2, padding: "10px 0", background: photoLoading ? "#777" : INK, color: "#fff",
-                          border: "none", fontWeight: 900, fontSize: 12, letterSpacing: 1, textTransform: "uppercase",
-                          cursor: photoLoading ? "wait" : "pointer", fontFamily: "inherit",
-                        }}
-                      >
-                        {photoLoading ? "Looking at your plate..." : `Analyze & log as ${MEAL_LABELS[manualMeal]}`}
-                      </button>
-                      <button
-                        onClick={() => setPhotoData(null)}
-                        style={{
-                          flex: 1, padding: "10px 0", background: "#fff", color: INK, border: `1.5px solid ${INK}`,
-                          fontWeight: 900, fontSize: 12, letterSpacing: 1, textTransform: "uppercase",
-                          cursor: "pointer", fontFamily: "inherit",
-                        }}
-                      >
-                        Retake
-                      </button>
-                    </div>
-                  </div>
-                )}
-                {photoError && (
-                  <div style={{ marginTop: 8, padding: "8px 10px", border: `1.5px solid ${RED}`, color: RED, fontSize: 13, background: "#fff" }}>
-                    {photoError}
-                  </div>
-                )}
-                <div style={{ fontSize: 11, color: "#555", marginTop: 8, lineHeight: 1.4 }}>
-                  Photo estimates are rough (±25%) since portion sizes are hard to judge
-                  from one angle. When you know the amounts, typing them is more accurate.
-                </div>
-              </div>
             </div>
 
             {/* Stats + goals */}
@@ -1794,6 +1989,130 @@ export default function EvansMeals() {
                     Fill in age, weight, and height to see your numbers.
                   </div>
                 )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ---- WORKOUT ---- */}
+        {tab === "workout" && (
+          <div>
+            {/* Date navigator (shared current day with the Log tab) */}
+            <div style={{ display: "flex", alignItems: "stretch", border: `1.5px solid ${INK}`, background: "#fff", marginBottom: 16 }}>
+              <button
+                onClick={() => setViewDate(shiftDate(viewDate, -1))}
+                style={{ padding: "10px 16px", border: "none", borderRight: `1.5px solid ${INK}`, background: "transparent", fontWeight: 900, fontSize: 16, cursor: "pointer", fontFamily: "inherit" }}
+              >
+                ‹
+              </button>
+              <div style={{ flex: 1, textAlign: "center", padding: "10px 4px", fontWeight: 900, fontSize: 15 }}>
+                {prettyDate(viewDate)}
+                {viewDate !== todayStr() && (
+                  <button
+                    onClick={() => setViewDate(todayStr())}
+                    style={{ marginLeft: 10, fontSize: 10, fontWeight: 900, textTransform: "uppercase", letterSpacing: 1, background: TINT, border: `1px solid ${GREEN}`, color: GREEN, padding: "2px 6px", cursor: "pointer", fontFamily: "inherit" }}
+                  >
+                    Today
+                  </button>
+                )}
+              </div>
+              <button
+                onClick={() => setViewDate(shiftDate(viewDate, 1))}
+                style={{ padding: "10px 16px", border: "none", borderLeft: `1.5px solid ${INK}`, background: "transparent", fontWeight: 900, fontSize: 16, cursor: "pointer", fontFamily: "inherit" }}
+              >
+                ›
+              </button>
+            </div>
+
+            {/* Add exercise */}
+            <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+              <input
+                value={newExercise}
+                onChange={(e) => setNewExercise(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addExercise()}
+                placeholder="Exercise name (e.g. Bench press)"
+                style={{ ...inputStyle, flex: 1 }}
+              />
+              <button
+                onClick={addExercise}
+                style={{
+                  padding: "0 18px", background: GREEN, color: "#fff", border: "none",
+                  fontWeight: 900, fontSize: 13, letterSpacing: 1, textTransform: "uppercase",
+                  cursor: "pointer", fontFamily: "inherit",
+                }}
+              >
+                + Add
+              </button>
+            </div>
+
+            {/* Day summary */}
+            {dayWorkouts.length > 0 && (
+              <div style={{ border: `1.5px solid ${INK}`, background: "#fff", padding: "8px 12px", marginBottom: 16, display: "flex", justifyContent: "space-between", fontSize: 13, fontWeight: 700 }}>
+                <span>{dayWorkouts.length} exercise{dayWorkouts.length === 1 ? "" : "s"}</span>
+                <span>{workoutTotals.sets} set{workoutTotals.sets === 1 ? "" : "s"}</span>
+                <span>{workoutTotals.reps} total reps</span>
+              </div>
+            )}
+
+            {/* Exercise "spreadsheet" */}
+            {dayWorkouts.length === 0 ? (
+              <div style={{ textAlign: "center", padding: "48px 16px", border: `1.5px dashed ${RULE}`, fontSize: 14, color: "#666" }}>
+                No exercises logged for {prettyDate(viewDate).toLowerCase()}. Add your first one above.
+              </div>
+            ) : (
+              <div style={{ border: `1.5px solid ${INK}`, background: "#fff" }}>
+                <div style={{ display: "flex", background: INK, color: PAPER, fontWeight: 900, fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>
+                  <div style={{ flex: 2, padding: "6px 10px" }}>Exercise</div>
+                  <div style={{ width: 96, padding: "6px 10px", textAlign: "center" }}>Sets</div>
+                  <div style={{ flex: 3, padding: "6px 10px" }}>Reps</div>
+                  <div style={{ width: 34 }} />
+                </div>
+                {dayWorkouts.map((wk) => (
+                  <div key={wk.id} style={{ display: "flex", alignItems: "center", borderTop: `1px solid ${RULE}` }}>
+                    <div style={{ flex: 2, padding: "8px 10px", fontWeight: 700, fontSize: 14, wordBreak: "break-word" }}>
+                      {wk.exercise}
+                    </div>
+                    <div style={{ width: 96, padding: "8px 4px", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                      <button
+                        onClick={() => changeSets(wk.id, -1)}
+                        style={{ width: 24, height: 24, background: "#fff", border: `1.5px solid ${INK}`, fontWeight: 900, fontSize: 14, cursor: "pointer", fontFamily: "inherit", lineHeight: 1 }}
+                      >
+                        −
+                      </button>
+                      <span style={{ fontWeight: 900, fontSize: 14, minWidth: 16, textAlign: "center" }}>
+                        {wk.sets.length}
+                      </span>
+                      <button
+                        onClick={() => changeSets(wk.id, 1)}
+                        style={{ width: 24, height: 24, background: "#fff", border: `1.5px solid ${INK}`, fontWeight: 900, fontSize: 14, cursor: "pointer", fontFamily: "inherit", lineHeight: 1 }}
+                      >
+                        +
+                      </button>
+                    </div>
+                    <div style={{ flex: 3, padding: "8px 10px", display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      {wk.sets.map((reps, i) => (
+                        <input
+                          key={i}
+                          type="number"
+                          min="0"
+                          value={reps}
+                          onChange={(e) => updateReps(wk.id, i, e.target.value)}
+                          placeholder={`Set ${i + 1}`}
+                          style={{ ...inputStyle, width: 62, padding: 6, fontSize: 13, textAlign: "center" }}
+                        />
+                      ))}
+                    </div>
+                    <div style={{ width: 34, textAlign: "center" }}>
+                      <button
+                        onClick={() => deleteExercise(wk.id)}
+                        style={{ background: "none", border: "none", color: RED, fontWeight: 900, fontSize: 16, cursor: "pointer", fontFamily: "inherit" }}
+                        title="Remove exercise"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
           </div>
