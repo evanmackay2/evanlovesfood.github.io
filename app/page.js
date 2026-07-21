@@ -35,6 +35,21 @@ const ACTIVITY_LEVELS = [
 
 const STORAGE_KEY = "evansmeals-data-v1";
 
+// Identify where a recipe came from, for display on its card
+const sourceInfo = (url) => {
+  if (!url) return null;
+  const u = url.toLowerCase();
+  if (/youtube\.com|youtu\.be/.test(u)) return { label: "YouTube", icon: "▶" };
+  if (/tiktok\.com/.test(u)) return { label: "TikTok", icon: "♪" };
+  if (/instagram\.com/.test(u)) return { label: "Instagram", icon: "◎" };
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, "");
+    return { label: host, icon: "🔗" };
+  } catch (e) {
+    return { label: "Original source", icon: "🔗" };
+  }
+};
+
 // Older workout sets were plain rep counts; normalize them to {weight, reps}
 const normalizeSets = (sets) =>
   (sets || []).map((s) =>
@@ -460,6 +475,7 @@ export default function EvansMeals() {
         category: CATEGORIES.includes(ing.category) ? ing.category : "other",
       })),
       stepsText: (r.steps || []).join("\n"),
+      source: r.source || "",
     });
   };
 
@@ -505,6 +521,7 @@ export default function EvansMeals() {
           .split("\n")
           .map((s) => s.trim())
           .filter(Boolean),
+        source: (draft.source || "").trim(),
       };
     });
     setRecipes(nextRecipes);
@@ -1642,6 +1659,11 @@ export default function EvansMeals() {
                       <div style={{ fontSize: 12, color: "#555", marginTop: 2 }}>
                         {Math.round(r.perServing?.calories ?? 0)} cal · {Math.round(r.perServing?.protein_g ?? 0)}g protein
                         {r.prepMinutes ? ` · ${r.prepMinutes} min` : ""}
+                        {sourceInfo(r.source) && (
+                          <span style={{ color: GREEN, fontWeight: 700 }}>
+                            {" "}· {sourceInfo(r.source).icon} {sourceInfo(r.source).label}
+                          </span>
+                        )}
                       </div>
                     </div>
                     <div style={{ fontSize: 18, fontWeight: 900 }}>{isOpen ? "–" : "+"}</div>
@@ -1649,6 +1671,30 @@ export default function EvansMeals() {
 
                   {isOpen && !isEditing && (
                     <div style={{ borderTop: `1.5px solid ${INK}`, padding: 14 }}>
+                      {r.source && (
+                        <a
+                          href={r.source}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{
+                            display: "flex", alignItems: "center", justifyContent: "space-between",
+                            gap: 8, textDecoration: "none", background: TINT,
+                            border: `1.5px solid ${GREEN}`, padding: "8px 10px", marginBottom: 14,
+                          }}
+                        >
+                          <span style={{ minWidth: 0 }}>
+                            <span style={{ fontSize: 10, fontWeight: 900, textTransform: "uppercase", letterSpacing: 1, color: GREEN, display: "block" }}>
+                              {sourceInfo(r.source).icon} From {sourceInfo(r.source).label}
+                            </span>
+                            <span style={{ fontSize: 11, color: "#555", wordBreak: "break-all", display: "block", marginTop: 1 }}>
+                              {r.source.length > 58 ? r.source.slice(0, 58) + "..." : r.source}
+                            </span>
+                          </span>
+                          <span style={{ fontSize: 10, fontWeight: 900, textTransform: "uppercase", letterSpacing: 1, color: "#fff", background: GREEN, padding: "6px 10px", whiteSpace: "nowrap" }}>
+                            Open ↗
+                          </span>
+                        </a>
+                      )}
                       <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
                         <MacroLabel macros={r.perServing} servings={r.servings} />
                         <div style={{ flex: 1, minWidth: 200 }}>
@@ -1673,14 +1719,6 @@ export default function EvansMeals() {
                           <span>{s}</span>
                         </div>
                       ))}
-                      {r.source && (
-                        <div style={{ fontSize: 12, marginTop: 10, wordBreak: "break-all" }}>
-                          <a href={r.source} target="_blank" rel="noreferrer" style={{ color: GREEN }}>
-                            View the original source
-                          </a>
-                        </div>
-                      )}
-
                       <div style={{ display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap" }}>
                         <button
                           onClick={() => openLogPanel(r.id)}
@@ -1885,6 +1923,16 @@ export default function EvansMeals() {
                           onChange={(e) => updateDraft("stepsText", e.target.value)}
                           rows={Math.max(4, draft.stepsText.split("\n").length + 1)}
                           style={{ ...inputStyle, width: "100%", marginTop: 4, resize: "vertical", lineHeight: 1.5 }}
+                        />
+                      </div>
+
+                      <div style={{ marginTop: 12 }}>
+                        <label style={smallLabel}>Source link (optional)</label>
+                        <input
+                          value={draft.source || ""}
+                          onChange={(e) => updateDraft("source", e.target.value)}
+                          placeholder="https://..."
+                          style={{ ...inputStyle, width: "100%", marginTop: 4, fontSize: 13 }}
                         />
                       </div>
 
