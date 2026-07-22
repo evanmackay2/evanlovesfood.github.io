@@ -108,6 +108,7 @@ export default function EvansMeals() {
   const [progressMetric, setProgressMetric] = useState("max"); // "max" | "volume"
   const [nowTick, setNowTick] = useState(Date.now());
   const [burnLoading, setBurnLoading] = useState(false);
+  const [repRange, setRepRange] = useState({ low: 6, high: 10 });
 
   // Progress photos
   const [progressPhotos, setProgressPhotos] = useState([]); // {id, date, path, note}
@@ -223,6 +224,7 @@ export default function EvansMeals() {
           setSessions(data.sessions || {});
           setTemplates(data.templates || []);
           setProgressPhotos(data.progressPhotos || []);
+          if (data.repRange) setRepRange(data.repRange);
           if (data.goals) setGoals(data.goals);
           if (data.profile) setProfile(data.profile);
         } else {
@@ -276,7 +278,7 @@ export default function EvansMeals() {
 
   // ---- Persist: instant local cache + debounced cloud write ----
   const persist = (next) => {
-    const current = { recipes, selected, checked, log, workouts, sessions, templates, progressPhotos, goals, profile, ...next };
+    const current = { recipes, selected, checked, log, workouts, sessions, templates, progressPhotos, repRange, goals, profile, ...next };
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(current));
     } catch (e) {
@@ -866,6 +868,19 @@ export default function EvansMeals() {
     persist({ workouts: nextWorkouts });
   };
 
+  const applyRecommendation = (id, rec) => {
+    const nextWorkouts = workouts.map((wk) => {
+      if (wk.id !== id) return wk;
+      const sets = wk.sets.map((s) => ({
+        weight: s.weight === "" ? String(rec.weight) : s.weight,
+        reps: s.reps === "" ? String(rec.reps) : s.reps,
+      }));
+      return { ...wk, sets };
+    });
+    setWorkouts(nextWorkouts);
+    persist({ workouts: nextWorkouts });
+  };
+
   const deleteExercise = (id) => {
     const nextWorkouts = workouts.filter((wk) => wk.id !== id);
     setWorkouts(nextWorkouts);
@@ -1036,6 +1051,62 @@ export default function EvansMeals() {
   const shortDate = (dateStr) => {
     const [, m, d] = dateStr.split("-").map(Number);
     return `${m}/${d}`;
+  };
+
+  // ---- Progressive-overload recommendation ----
+  // Lower-body / compound lifts jump in bigger plates than upper-body isolation.
+  const isLowerBody = (name) => {
+    const n = name.toLowerCase();
+    return /squat|deadlift|leg press|lunge|hip thrust|leg curl|leg extension|calf|romanian|rdl|hack/.test(n);
+  };
+
+  // Find the most recent PAST session for an exercise (before the viewed day)
+  const lastSessionFor = (exerciseName) => {
+    const key = exerciseName.trim().toLowerCase();
+    const past = workouts
+      .filter((wk) => wk.exercise.trim().toLowerCase() === key && wk.date < viewDate)
+      .sort((a, b) => (a.date < b.date ? 1 : -1));
+    return past[0] || null;
+  };
+
+  const recommendFor = (exerciseName) => {
+    const last = lastSessionFor(exerciseName);
+    if (!last) return null;
+
+    // Only consider completed sets (both weight and reps entered)
+    const sets = last.sets
+      .map((s) => ({ weight: Number(s.weight) || 0, reps: Number(s.reps) || 0 }))
+      .filter((s) => s.weight > 0 && s.reps > 0);
+    if (sets.length === 0) return null;
+
+    const { low, high } = repRange;
+    const workingWeight = Math.max(...sets.map((s) => s.weight));
+    const workingSets = sets.filter((s) => s.weight === workingWeight);
+    const step = isLowerBody(exerciseName) ? 10 : 5;
+
+    const allHitTop = workingSets.every((s) => s.reps >= high);
+    const anyBelowLow = workingSets.some((s) => s.reps < low);
+    const bestReps = Math.max(...workingSets.map((s) => s.reps));
+
+    let weight, reps, note, tone;
+    if (allHitTop) {
+      weight = workingWeight + step;
+      reps = low;
+      note = `You hit ${high}+ reps on every set last time — add ${step} lbs.`;
+      tone = "up";
+    } else if (anyBelowLow) {
+      weight = Math.max(step, workingWeight - step);
+      reps = low;
+      note = `Last time was a grind — drop ${step} lbs and rebuild.`;
+      tone = "down";
+    } else {
+      weight = workingWeight;
+      reps = Math.min(high, bestReps + 1);
+      note = `Stay at ${workingWeight} lbs and push for ${reps} reps.`;
+      tone = "hold";
+    }
+
+    return { weight, reps, note, tone, lastDate: last.date, lastWeight: workingWeight, sets: workingSets.length };
   };
 
   // ---- Progress photos ----
@@ -2442,6 +2513,35 @@ export default function EvansMeals() {
               </button>
             </div>
 
+            {/* Target rep range */}
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, fontSize: 12 }}>
+              <span style={{ fontWeight: 900, textTransform: "uppercase", letterSpacing: 1, color: "#555" }}>
+                Target reps:
+              </span>
+              <input
+                type="number"
+                min="1"
+                value={repRange.low}
+                onChange={(e) => {
+                  const next = { ...repRange, low: Number(e.target.value) || 1 };
+                  setRepRange(next); persist({ repRange: next });
+                }}
+                style={{ ...inputStyle, width: 52, padding: 6, fontSize: 13, textAlign: "center" }}
+              />
+              <span style={{ fontWeight: 700 }}>to</span>
+              <input
+                type="number"
+                min="1"
+                value={repRange.high}
+                onChange={(e) => {
+                  const next = { ...repRange, high: Number(e.target.value) || 1 };
+                  setRepRange(next); persist({ repRange: next });
+                }}
+                style={{ ...inputStyle, width: 52, padding: 6, fontSize: 13, textAlign: "center" }}
+              />
+              <span style={{ color: "#888", fontSize: 11 }}>drives your suggestions</span>
+            </div>
+
             {/* Templates */}
             {templates.length > 0 && dayWorkouts.length === 0 && (
               <div style={{ marginBottom: 12 }}>
@@ -2492,7 +2592,9 @@ export default function EvansMeals() {
                   <div style={{ width: 90, padding: "6px 4px", textAlign: "center" }}>Sets</div>
                   <div style={{ width: 34 }} />
                 </div>
-                {dayWorkouts.map((wk) => (
+                {dayWorkouts.map((wk) => {
+                  const rec = recommendFor(wk.exercise);
+                  return (
                   <div key={wk.id} style={{ borderTop: `1px solid ${RULE}` }}>
                     <div style={{ display: "flex", alignItems: "center" }}>
                       <div style={{ flex: 1, padding: "8px 10px", fontWeight: 700, fontSize: 14, wordBreak: "break-word" }}>
@@ -2525,6 +2627,23 @@ export default function EvansMeals() {
                         </button>
                       </div>
                     </div>
+                    {rec && (
+                      <div style={{ margin: "0 10px 8px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, background: rec.tone === "up" ? TINT : rec.tone === "down" ? "#FDECEA" : "#fff", border: `1.5px solid ${rec.tone === "down" ? RED : GREEN}`, padding: "6px 8px" }}>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontSize: 12, fontWeight: 900 }}>
+                            <span style={{ color: rec.tone === "down" ? RED : GREEN }}>Target: {rec.weight} lbs × {rec.reps}</span>
+                            <span style={{ fontWeight: 400, color: "#888" }}> (last: {rec.lastWeight} lbs)</span>
+                          </div>
+                          <div style={{ fontSize: 11, color: "#555", lineHeight: 1.3 }}>{rec.note}</div>
+                        </div>
+                        <button
+                          onClick={() => applyRecommendation(wk.id, rec)}
+                          style={{ padding: "6px 10px", background: rec.tone === "down" ? RED : GREEN, color: "#fff", border: "none", fontWeight: 900, fontSize: 10, letterSpacing: 0.5, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}
+                        >
+                          Fill in
+                        </button>
+                      </div>
+                    )}
                     <div style={{ padding: "0 10px 10px", display: "flex", gap: 6, flexWrap: "wrap" }}>
                       {wk.sets.map((s, i) => (
                         <div key={i} style={{ display: "flex", alignItems: "center", gap: 3, border: `1px solid ${RULE}`, padding: "4px 6px", background: PAPER }}>
@@ -2550,7 +2669,8 @@ export default function EvansMeals() {
                       ))}
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             )}
 
